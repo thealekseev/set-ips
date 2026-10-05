@@ -29,7 +29,7 @@ chmod +x set-ips.sh
 sudo ./set-ips.sh
 ```
 
-###🏎️ Вариант 2: Запуск одной командой
+### 🏎️ Вариант 2: Запуск одной командой
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/thealekseev/set-ips/refs/heads/main/set-ips.sh)
 ```
