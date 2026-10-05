@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# Интерактивный менеджер IP и DNS для Netplan (Версия 8.5.1)
-# Исправлено: корректный вывод цветов в меню выбора DNS, умная замена/добавление
+# Интерактивный менеджер IP и DNS для Netplan (Версия 8.6)
+# Исправлено: работа с существующим файлом Netplan, проверка дубликатов
 # ==============================================================================
 
 set -uo pipefail
@@ -38,7 +38,7 @@ run_cmd() {
 
     echo -ne "${CYAN}[...]${NC} $description "
     local start_ms=$(date +%s%3N 2>/dev/null || echo "$(date +%s)000")
-    local spin_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local spin_chars=('' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '')
     local i=0
     local tmpfile
     tmpfile=$(mktemp)
@@ -92,7 +92,13 @@ if ! command -v netplan &>/dev/null; then
     exit 1
 fi
 
-NETPLAN_FILE="/etc/netplan/99-static-ips.yaml"
+# FIX: Ищем существующий файл Netplan, создаём новый только если нет ни одного
+find_primary_netplan_file() {
+    find /etc/netplan -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | sort | head -n 1
+}
+
+NETPLAN_FILE=$(find_primary_netplan_file)
+[[ -z "$NETPLAN_FILE" ]] && NETPLAN_FILE="/etc/netplan/99-static-ips.yaml"
 
 check_python() {
     if ! command -v python3 &>/dev/null; then
@@ -113,12 +119,32 @@ check_python
 
 # ---------- Python-хелпер ----------
 PYTHON_HELPER=$(cat <<'PYEOF'
-import sys, yaml, os
+import sys, yaml, os, re
 
 def load(path):
     if not os.path.exists(path):
         return {}
     try:
+        # Проверка на дубликаты ключей
+        with open(path, 'r') as f:
+            content = f.read()
+        
+        # Простая проверка дубликатов ключей в YAML
+        lines = content.split('\n')
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('-') or ':' not in stripped:
+                continue
+            key = stripped.split(':')[0].strip()
+            # Проверяем, есть ли этот же ключ на том же уровне вложенности
+            indent = len(line) - len(line.lstrip())
+            for j in range(i+1, len(lines)):
+                next_line = lines[j]
+                next_stripped = next_line.strip()
+                next_indent = len(next_line) - len(next_line.lstrip())
+                if next_indent == indent and next_stripped.startswith(key + ':'):
+                    print(f"WARNING: Дублирующийся ключ '{key}' на строке {i+1} и {j+1}", file=sys.stderr)
+        
         with open(path) as f:
             return yaml.safe_load(f) or {}
     except yaml.YAMLError as e:
@@ -339,21 +365,32 @@ find_any_netplan_file() {
     find /etc/netplan -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | sort | head -n 1
 }
 
+# FIX: Используем существующий файл или создаём новый
 ensure_netplan_file() {
-    if [[ ! -f "$NETPLAN_FILE" ]]; then
-        local renderer="networkd"
-        if grep -qE "renderer:[[:space:]]*NetworkManager" /etc/netplan/*.yaml 2>/dev/null; then
-            renderer="NetworkManager"
-        fi
-        
-        info_stderr "Создаю $NETPLAN_FILE"
-        cat > "$NETPLAN_FILE" <<EOF
+    local existing_file
+    existing_file=$(find_primary_netplan_file)
+    
+    if [[ -n "$existing_file" ]]; then
+        # Используем существующий файл
+        NETPLAN_FILE="$existing_file"
+        info_stderr "Используем существующий файл: $NETPLAN_FILE"
+    else
+        # Создаём новый файл
+        if [[ ! -f "$NETPLAN_FILE" ]]; then
+            local renderer="networkd"
+            if grep -qE "renderer:[[:space:]]*NetworkManager" /etc/netplan/*.yaml 2>/dev/null; then
+                renderer="NetworkManager"
+            fi
+            
+            info_stderr "Создаю $NETPLAN_FILE"
+            cat > "$NETPLAN_FILE" <<EOF
 network:
   version: 2
   renderer: $renderer
   ethernets: {}
 EOF
-        chmod 600 "$NETPLAN_FILE"
+            chmod 600 "$NETPLAN_FILE"
+        fi
     fi
     printf '%s\n' "$NETPLAN_FILE"
 }
@@ -692,7 +729,7 @@ add_ips_to_netplan() {
         applied) info "✅ Конфигурация обновлена!" ;;
         saved)   info "💾 Изменения сохранены. Примените: sudo netplan apply" ;;
         bad_choice) warn "⚠ Некорректный выбор. Примените вручную: sudo netplan apply" ;;
-        failed)  warn "⚠ Изменения не применены (произошёл откат к резервной копии)." ;;
+        failed)  warn " Изменения не применены (произошёл откат к резервной копии)." ;;
     esac
 }
 
@@ -900,7 +937,6 @@ apply_dns_to_netplan() {
     if [[ -n "$existing_dns" ]]; then
         echo
         warn "Для интерфейса $iface уже настроены DNS: ${existing_dns//,/ }"
-        # FIX: добавлен ключ -e для корректного отображения цветов
         echo -e "  ${GREEN}1${NC}) Заменить старые DNS на новые (рекомендуется)"
         echo -e "  ${GREEN}2${NC}) Добавить новые DNS к существующим"
         echo -e "  ${RED}0${NC}) Отмена"
@@ -1118,8 +1154,8 @@ dns_management() {
                     esac
                     case "$result" in
                         applied) info "✅ Конфигурация обновлена!" ;;
-                        saved)   info "💾 Изменения сохранены. Примените: sudo netplan apply" ;;
-                        bad_choice) warn "⚠ Некорректный выбор. Примените вручную: sudo netplan apply" ;;
+                        saved)   info " Изменения сохранены. Примените: sudo netplan apply" ;;
+                        bad_choice) warn " Некорректный выбор. Примените вручную: sudo netplan apply" ;;
                         failed)  warn "⚠ Изменения не применены (произошёл откат к резервной копии)." ;;
                     esac
                 fi
