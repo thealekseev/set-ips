@@ -1,4 +1,4 @@
-[![VDSINA — хостинг VPS и VDS](.vps-setup/assets/banner.png)](https://www.vdsina.com/?partner=f963ce3tpyrr)
+[![VDSINA — хостинг VPS и VDS](./vps-setup/assets/banner.png)](https://www.vdsina.com/?partner=f963ce3tpyrr)
 # 🌐 Интерактивный менеджер IP-адресов и DNS-серверов для Netplan - Set-IPs
 
 ## 📋 Описание
@@ -12,19 +12,19 @@
 
 Этот способ позволяет проверить содержимое скрипта перед его выполнением.
 
-# 1. Скачать скрипт в текущую директорию
+#### 1. Скачать скрипт в текущую директорию
 ```bash
 curl -fsSL -o set-ips.sh https://raw.githubusercontent.com/thealekseev/set-ips/refs/heads/main/set-ips.sh
 ```
-# 2. (Опционально) Просмотреть содержимое для проверки безопасности
+#### 2. (Опционально) Просмотреть содержимое для проверки безопасности
 ```bash
 less set-ips.sh
 ```
-# 3. Сделать файл исполняемым
+#### 3. Сделать файл исполняемым
 ```bash
 chmod +x set-ips.sh
 ```
-# 4. Запустить от имени root
+#### 4. Запустить от имени root
 ```bash
 sudo ./set-ips.sh
 ```
