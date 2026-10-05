@@ -12,18 +12,22 @@
 
 Этот способ позволяет проверить содержимое скрипта перед его выполнением.
 
-```bash
 # 1. Скачать скрипт в текущую директорию
+```bash
 curl -fsSL -o set-ips.sh https://raw.githubusercontent.com/thealekseev/set-ips/refs/heads/main/set-ips.sh
-
+```
 # 2. (Опционально) Просмотреть содержимое для проверки безопасности
+```bash
 less set-ips.sh
-
+```
 # 3. Сделать файл исполняемым
+```bash
 chmod +x set-ips.sh
-
+```
 # 4. Запустить от имени root
+```bash
 sudo ./set-ips.sh
+```
 
 ## ✨ Возможности
 
