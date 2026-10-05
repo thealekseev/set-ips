@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# Интерактивный менеджер IP и DNS для Netplan
-# Версия: 8.5 (Production-Ready)
+# Интерактивный менеджер IP и DNS для Netplan (Версия 8.5)
+# Исправлено: умная замена/добавление DNS, защита от CRLF, полный откат
 # ==============================================================================
 
 set -uo pipefail
@@ -18,6 +18,7 @@ error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 ok()    { echo -e "${GREEN}[ OK ]${NC} $*"; }
 header(){ echo -e "\n${CYAN}═══════════════════════════════════════════════════${NC}"; echo -e "${CYAN}  $*${NC}"; echo -e "${CYAN}═══════════════════════════════════════════════════${NC}\n"; }
 
+# Перехват сигналов
 trap 'echo; warn "Прервано пользователем (SIGINT)."; exit 130' INT
 trap 'echo; warn "Прервано (SIGTERM)."; exit 143' TERM
 
@@ -26,13 +27,13 @@ run_cmd() {
     local description="$1"
     local timeout_sec="${2:-60}"
     shift 2
-
+    
     local show_output="no"
     if [[ "${1:-}" == "yes" || "${1:-}" == "no" ]]; then
         show_output="$1"
         shift
     fi
-
+    
     local cmd=("$@")
 
     echo -ne "${CYAN}[...]${NC} $description "
@@ -169,18 +170,31 @@ if action == "get_dns":
     sys.exit(0)
 
 if action == "set_dns":
-    if len(sys.argv) < 4:
-        print("ERROR: не указан интерфейс", file=sys.stderr)
+    if len(sys.argv) < 5:
+        print("ERROR: не указаны аргументы", file=sys.stderr)
         sys.exit(2)
     iface = sys.argv[3]
-    dns_list = sys.argv[4:]
+    mode = sys.argv[4]  # "replace" или "append"
+    dns_list = sys.argv[5:]
+    
     net = cfg.setdefault("network", {})
     eth = net.setdefault("ethernets", {})
     if_cfg = eth.setdefault(iface, {})
     ns = if_cfg.setdefault("nameservers", {})
-    ns["addresses"] = list(dns_list)
+    
+    current_addrs = ns.get("addresses", []) or []
+    
+    if mode == "append":
+        for d in dns_list:
+            if d not in current_addrs:
+                current_addrs.append(d)
+        ns["addresses"] = current_addrs
+        print(f"DNS для {iface} дополнены: {', '.join(dns_list)}")
+    else:
+        ns["addresses"] = list(dns_list)
+        print(f"DNS для {iface} заменены на: {', '.join(dns_list)}")
+        
     save(path, cfg)
-    print(f"DNS для {iface} обновлён: {', '.join(dns_list)}")
     sys.exit(0)
 
 if action == "clear_dns":
@@ -328,11 +342,10 @@ find_any_netplan_file() {
 ensure_netplan_file() {
     if [[ ! -f "$NETPLAN_FILE" ]]; then
         local renderer="networkd"
-        # FIX: Заменён нестандартный \s на POSIX-совместимый [[:space:]]
         if grep -qE "renderer:[[:space:]]*NetworkManager" /etc/netplan/*.yaml 2>/dev/null; then
             renderer="NetworkManager"
         fi
-
+        
         info_stderr "Создаю $NETPLAN_FILE"
         cat > "$NETPLAN_FILE" <<EOF
 network:
@@ -399,8 +412,7 @@ get_ssh_ip() {
     elif [[ -n "${SSH_CLIENT:-}" ]]; then
         echo "${SSH_CLIENT}" | awk '{print $1}'
     else
-        local current_tty
-        current_tty=$(tty 2>/dev/null | sed 's|/dev/||')
+        local current_tty=$(tty 2>/dev/null | sed 's|/dev/||')
         ss -tnp 2>/dev/null | grep "ssh" | grep "$current_tty" | awk '{print $5}' | cut -d: -f1 | head -n 1
     fi
 }
@@ -420,7 +432,7 @@ apply_netplan_safely() {
         info "Проверка синтаксиса..."
         local errfile
         errfile=$(mktemp)
-
+        
         if ! netplan generate 2>"$errfile"; then
             error "netplan generate не прошёл. Проверьте вывод:"
             sed 's/^/  /' "$errfile"
@@ -621,13 +633,20 @@ add_ips_to_netplan() {
         echo -e "    ${RED}0${NC}) Отмена"
         local dhcp_choice
         safe_read -p "Выбор [0-3]: " dhcp_choice || return 1
-        # FIX: Проверяем код возврата add_iface и откатываем при ошибке
+        
+        local iface_ok=0
         case "$dhcp_choice" in
-            1) python3 -c "$PYTHON_HELPER" add_iface "$netplan_file" "$iface" no    || { error "Ошибка создания секции. Откат..."; install -m 600 "$backup" "$netplan_file"; return 1; } ;;
-            2) python3 -c "$PYTHON_HELPER" add_iface "$netplan_file" "$iface" yes   || { error "Ошибка создания секции. Откат..."; install -m 600 "$backup" "$netplan_file"; return 1; } ;;
-            3) python3 -c "$PYTHON_HELPER" add_iface "$netplan_file" "$iface" keep  || { error "Ошибка создания секции. Откат..."; install -m 600 "$backup" "$netplan_file"; return 1; } ;;
-            0|*) info "Отменено."; return 1 ;;
+            1) python3 -c "$PYTHON_HELPER" add_iface "$netplan_file" "$iface" no && iface_ok=1 ;;
+            2) python3 -c "$PYTHON_HELPER" add_iface "$netplan_file" "$iface" yes && iface_ok=1 ;;
+            3) python3 -c "$PYTHON_HELPER" add_iface "$netplan_file" "$iface" keep && iface_ok=1 ;;
+            0|*) info "Отменено."; install -m 600 "$backup" "$netplan_file"; return 1 ;;
         esac
+        if [[ $iface_ok -ne 1 ]]; then
+            error "Ошибка создания секции интерфейса. Откат..."
+            install -m 600 "$backup" "$netplan_file"
+            netplan apply 2>/dev/null || true
+            return 1
+        fi
         info "Базовая запись для $iface создана."
     fi
 
@@ -658,7 +677,7 @@ add_ips_to_netplan() {
     local result="failed"
     case "$apply_choice" in
         1) apply_netplan_safely "$netplan_file" "$backup" try && result="applied" ;;
-        2)
+        2) 
             if apply_netplan_safely "$netplan_file" "$backup" apply; then
                 result="applied"
             else
@@ -689,10 +708,10 @@ remove_ip_from_netplan() {
         return 1
     fi
 
-    # FIX: Защита от пустого значения total (арифметическая ошибка при set -u)
     local total
-    total=$(python3 -c "$PYTHON_HELPER" count_ips "$netplan_file" "$iface" 2>/dev/null || echo 0)
+    total=$(python3 -c "$PYTHON_HELPER" count_ips "$netplan_file" "$iface" 2>/dev/null) || true
     total=${total:-0}
+    [[ "$total" =~ ^[0-9]+$ ]] || total=0
 
     header "Удаление IP с $iface"
     echo "Доступные адреса в конфиге:"
@@ -873,6 +892,29 @@ apply_dns_to_netplan() {
     local netplan_file
     netplan_file=$(ensure_netplan_file)
 
+    # Проверяем, есть ли уже DNS для этого интерфейса
+    local existing_dns
+    existing_dns=$(python3 -c "$PYTHON_HELPER" get_dns "$netplan_file" 2>/dev/null | grep "^$iface|" | cut -d'|' -f2)
+
+    local mode="replace"
+    if [[ -n "$existing_dns" ]]; then
+        echo
+        warn "Для интерфейса $iface уже настроены DNS: ${existing_dns//,/ }"
+        echo "  ${GREEN}1${NC}) Заменить старые DNS на новые (рекомендуется)"
+        echo "  ${GREEN}2${NC}) Добавить новые DNS к существующим"
+        echo "  ${RED}0${NC}) Отмена"
+        local dns_choice
+        safe_read -p "Ваш выбор [1]: " dns_choice || return 1
+        dns_choice=${dns_choice:-1}
+
+        case "$dns_choice" in
+            1) mode="replace" ;;
+            2) mode="append" ;;
+            0|*) info "Отменено."; return 1 ;;
+        esac
+    fi
+
+    # Бэкап создаётся ДО любых модификаций
     local backup="${netplan_file}.bak.$(date +%Y%m%d-%H%M%S)"
     create_backup "$netplan_file" "$backup"
     info "Бэкап создан: $backup"
@@ -882,24 +924,21 @@ apply_dns_to_netplan() {
         local ans
         safe_read -p "Создать секцию с dhcp4: false (только статика)? (Y/n): " ans || return 1
         if [[ "${ans,,}" != "n" ]]; then
-            # FIX: Проверяем код возврата add_iface и откатываем при ошибке
             if ! python3 -c "$PYTHON_HELPER" add_iface "$netplan_file" "$iface" no; then
-                error "Ошибка создания секции. Откат..."
+                error "Ошибка создания секции интерфейса. Откат..."
                 install -m 600 "$backup" "$netplan_file"
+                netplan apply 2>/dev/null || true
                 return 1
             fi
         else
+            install -m 600 "$backup" "$netplan_file"
             return 1
         fi
     fi
 
-    info "Устанавливаю DNS для $iface:"
-    local dns_ip
-    for dns_ip in "${dns_list[@]}"; do
-        echo "  • $dns_ip"
-    done
-
-    if ! python3 -c "$PYTHON_HELPER" set_dns "$netplan_file" "$iface" "${dns_list[@]}"; then
+    info "Применяю изменения DNS (режим: $mode)..."
+    
+    if ! python3 -c "$PYTHON_HELPER" set_dns "$netplan_file" "$iface" "$mode" "${dns_list[@]}"; then
         error "Ошибка при установке DNS. Откат..."
         install -m 600 "$backup" "$netplan_file"
         netplan apply 2>/dev/null || true
@@ -931,7 +970,7 @@ apply_dns_to_netplan() {
     esac
 
     case "$result" in
-        applied) info "✅ Конфигурация обновлена!" ;;
+        applied) info "✅ Конфигурация DNS обновлена!" ;;
         saved)   info "💾 Изменения сохранены. Примените: sudo netplan apply" ;;
         bad_choice) warn "⚠ Некорректный выбор. Примените вручную: sudo netplan apply" ;;
         failed)  warn "⚠ Изменения не применены (произошёл откат к резервной копии)." ;;
@@ -1035,10 +1074,10 @@ dns_management() {
                 ;;
             8)
                 select_interface || { safe_read -p "Нажмите Enter..."; continue; }
-
+                
                 local netplan_file
                 netplan_file=$(ensure_netplan_file)
-
+                
                 warn "Вы собираетесь очистить DNS в $netplan_file для $SELECTED_IFACE."
                 local confirm
                 safe_read -p "Продолжить? (y/N): " confirm || continue
@@ -1046,7 +1085,7 @@ dns_management() {
                     local backup="${netplan_file}.bak.$(date +%Y%m%d-%H%M%S)"
                     create_backup "$netplan_file" "$backup"
                     info "Бэкап создан: $backup"
-
+                    
                     if ! python3 -c "$PYTHON_HELPER" clear_dns "$netplan_file" "$SELECTED_IFACE"; then
                         error "Ошибка при очистке DNS. Откат..."
                         install -m 600 "$backup" "$netplan_file"
@@ -1068,7 +1107,7 @@ dns_management() {
                     local apply_choice
                     safe_read -p "Выбор [1]: " apply_choice || continue
                     apply_choice=${apply_choice:-1}
-
+                    
                     local result="failed"
                     case "$apply_choice" in
                         1) apply_netplan_safely "$netplan_file" "$backup" try && result="applied" ;;
@@ -1140,10 +1179,10 @@ main_menu() {
                 select_interface && remove_ip_from_netplan "$SELECTED_IFACE"
                 ;;
             3) show_netplan_config ;;
-            4)
+            4) 
                 clear 2>/dev/null || printf '\033[2J\033[H'
                 show_initial_status
-                continue
+                continue 
                 ;;
             5)
                 header "Диагностика Netplan"
