@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# Интерактивный менеджер IP и DNS для Netplan (Версия 8.6)
-# Исправлено: работа с существующим файлом Netplan, проверка дубликатов
+# Интерактивный менеджер IP и DNS для Netplan (Версия 8.7)
+# Исправлено: trap с откатом, обрезка @, выделенный файл, sort_keys, коды ошибок
 # ==============================================================================
 
 set -uo pipefail
@@ -18,7 +18,7 @@ error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 ok()    { echo -e "${GREEN}[ OK ]${NC} $*"; }
 header(){ echo -e "\n${CYAN}═══════════════════════════════════════════════════${NC}"; echo -e "${CYAN}  $*${NC}"; echo -e "${CYAN}═══════════════════════════════════════════════════${NC}\n"; }
 
-# Перехват сигналов
+# Глобальный trap (восстанавливается внутри apply_netplan_safely)
 trap 'echo; warn "Прервано пользователем (SIGINT)."; exit 130' INT
 trap 'echo; warn "Прервано (SIGTERM)."; exit 143' TERM
 
@@ -38,7 +38,7 @@ run_cmd() {
 
     echo -ne "${CYAN}[...]${NC} $description "
     local start_ms=$(date +%s%3N 2>/dev/null || echo "$(date +%s)000")
-    local spin_chars=('' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '')
+    local spin_chars=('⠋' '⠙' '⠹' '' '⠼' '⠴' '⠦' '⠧' '' '⠏')
     local i=0
     local tmpfile
     tmpfile=$(mktemp)
@@ -92,13 +92,8 @@ if ! command -v netplan &>/dev/null; then
     exit 1
 fi
 
-# FIX: Ищем существующий файл Netplan, создаём новый только если нет ни одного
-find_primary_netplan_file() {
-    find /etc/netplan -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | sort | head -n 1
-}
-
-NETPLAN_FILE=$(find_primary_netplan_file)
-[[ -z "$NETPLAN_FILE" ]] && NETPLAN_FILE="/etc/netplan/99-static-ips.yaml"
+# FIX #3: Выделенный файл скрипта — всегда работаем только с ним
+NETPLAN_FILE="/etc/netplan/99-static-ips.yaml"
 
 check_python() {
     if ! command -v python3 &>/dev/null; then
@@ -118,33 +113,14 @@ check_python() {
 check_python
 
 # ---------- Python-хелпер ----------
+# FIX #5: коды возврата — 0=OK, 1=не найдено, 2=ошибка YAML/аргументов
 PYTHON_HELPER=$(cat <<'PYEOF'
-import sys, yaml, os, re
+import sys, yaml, os, glob
 
 def load(path):
     if not os.path.exists(path):
         return {}
     try:
-        # Проверка на дубликаты ключей
-        with open(path, 'r') as f:
-            content = f.read()
-        
-        # Простая проверка дубликатов ключей в YAML
-        lines = content.split('\n')
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith('-') or ':' not in stripped:
-                continue
-            key = stripped.split(':')[0].strip()
-            # Проверяем, есть ли этот же ключ на том же уровне вложенности
-            indent = len(line) - len(line.lstrip())
-            for j in range(i+1, len(lines)):
-                next_line = lines[j]
-                next_stripped = next_line.strip()
-                next_indent = len(next_line) - len(next_line.lstrip())
-                if next_indent == indent and next_stripped.startswith(key + ':'):
-                    print(f"WARNING: Дублирующийся ключ '{key}' на строке {i+1} и {j+1}", file=sys.stderr)
-        
         with open(path) as f:
             return yaml.safe_load(f) or {}
     except yaml.YAMLError as e:
@@ -153,7 +129,11 @@ def load(path):
 
 def save(path, cfg):
     with open(path, "w") as f:
-        yaml.safe_dump(cfg, f, default_flow_style=False)
+        # FIX #4: sort_keys=False с fallback для PyYAML < 5.1
+        try:
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+        except TypeError:
+            yaml.safe_dump(cfg, f, default_flow_style=False)
     os.chmod(path, 0o600)
 
 if len(sys.argv) < 3:
@@ -200,7 +180,7 @@ if action == "set_dns":
         print("ERROR: не указаны аргументы", file=sys.stderr)
         sys.exit(2)
     iface = sys.argv[3]
-    mode = sys.argv[4]  # "replace" или "append"
+    mode = sys.argv[4]
     dns_list = sys.argv[5:]
     
     net = cfg.setdefault("network", {})
@@ -241,6 +221,7 @@ if len(sys.argv) < 4:
 
 iface = sys.argv[3]
 
+# FIX #5: check_iface возвращает 0=найден, 1=не найден, 2=ошибка YAML
 if action == "check_iface":
     eth = (cfg.get("network", {}) or {}).get("ethernets", {}) or {}
     sys.exit(0 if iface in eth else 1)
@@ -329,6 +310,20 @@ if action == "remove_iface":
         print(f"Секция {iface} не найдена", file=sys.stderr)
         sys.exit(1)
     sys.exit(0)
+
+# FIX #3: поиск файла, где описан интерфейс (для отображения статуса)
+if action == "find_iface_file":
+    for f in sorted(glob.glob("/etc/netplan/*.yaml")):
+        try:
+            with open(f) as fh:
+                c = yaml.safe_load(fh) or {}
+            eth = (c.get("network", {}) or {}).get("ethernets", {}) or {}
+            if iface in eth:
+                print(f)
+                sys.exit(0)
+        except Exception:
+            pass
+    sys.exit(1)
 PYEOF
 )
 
@@ -357,40 +352,34 @@ declare -A DNS_IPV6=(
 
 # ---------- Утилиты ----------
 
+# FIX #2: обрезка @... (veth123@if2 → veth123) и фильтрация виртуальных
 get_interfaces() {
-    ip -o link show | awk -F': ' '$2 !~ /^(lo|docker|veth|br-|br[0-9]+|virbr|tun|tap|wg|bond|team)/ {print $2}'
+    ip -o link show | awk -F': ' '{
+        split($2, a, "@");
+        name = a[1];
+        if (name !~ /^(lo|docker|veth|br-|br[0-9]+|virbr|tun|tap|wg|bond|team)$/) print name
+    }'
 }
 
 find_any_netplan_file() {
     find /etc/netplan -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | sort | head -n 1
 }
 
-# FIX: Используем существующий файл или создаём новый
 ensure_netplan_file() {
-    local existing_file
-    existing_file=$(find_primary_netplan_file)
-    
-    if [[ -n "$existing_file" ]]; then
-        # Используем существующий файл
-        NETPLAN_FILE="$existing_file"
-        info_stderr "Используем существующий файл: $NETPLAN_FILE"
-    else
-        # Создаём новый файл
-        if [[ ! -f "$NETPLAN_FILE" ]]; then
-            local renderer="networkd"
-            if grep -qE "renderer:[[:space:]]*NetworkManager" /etc/netplan/*.yaml 2>/dev/null; then
-                renderer="NetworkManager"
-            fi
-            
-            info_stderr "Создаю $NETPLAN_FILE"
-            cat > "$NETPLAN_FILE" <<EOF
+    if [[ ! -f "$NETPLAN_FILE" ]]; then
+        local renderer="networkd"
+        if grep -qE "renderer:[[:space:]]*NetworkManager" /etc/netplan/*.yaml 2>/dev/null; then
+            renderer="NetworkManager"
+        fi
+        
+        info_stderr "Создаю выделенный файл $NETPLAN_FILE"
+        cat > "$NETPLAN_FILE" <<EOF
 network:
   version: 2
   renderer: $renderer
   ethernets: {}
 EOF
-            chmod 600 "$NETPLAN_FILE"
-        fi
+        chmod 600 "$NETPLAN_FILE"
     fi
     printf '%s\n' "$NETPLAN_FILE"
 }
@@ -455,6 +444,7 @@ get_ssh_ip() {
 }
 
 # ---------- Безопасное применение Netplan ----------
+# FIX #1: trap с откатом вместо trap - INT
 apply_netplan_safely() {
     local netplan_file="$1"
     local backup="$2"
@@ -485,16 +475,21 @@ apply_netplan_safely() {
         echo -e "${YELLOW}>>> Внимание: 'netplan try' применит конфиг на 120 секунд.${NC}"
         echo -e "${YELLOW}>>> Если связь по SSH пропадёт — НЕ подтверждайте, изменения откатятся сами.${NC}"
         echo -e "${YELLOW}>>> Для подтверждения успешного применения нажмите Enter.${NC}"
+        echo -e "${YELLOW}>>> Ctrl+C — отмена с откатом бэкапа.${NC}"
         echo
 
-        trap - INT
+        # FIX #1: сохраняем текущий trap и ставим обработчик с откатом
+        local saved_trap
+        saved_trap=$(trap -p INT 2>/dev/null || true)
+        trap 'error "Прервано пользователем. Откатываю изменения..."; install -m 600 "'"$backup"'" "'"$netplan_file"'" 2>/dev/null; netplan apply 2>/dev/null || true; exit 130' INT
+
         if netplan try --timeout 120; then
             ok "Конфигурация применена и подтверждена."
-            trap 'echo; warn "Прервано пользователем (SIGINT)."; exit 130' INT
+            eval "$saved_trap"
             return 0
         else
             error "Конфиг не подтверждён или отменён. Выполняю принудительный откат..."
-            trap 'echo; warn "Прервано пользователем (SIGINT)."; exit 130' INT
+            eval "$saved_trap"
             if [[ -n "$backup" && -f "$backup" ]]; then
                 install -m 600 "$backup" "$netplan_file"
                 netplan apply 2>/dev/null || true
@@ -517,8 +512,6 @@ apply_netplan_safely() {
 # ---------- Отображение статуса ----------
 show_initial_status() {
     header "Текущий статус сетевых интерфейсов"
-    local netplan_file="$NETPLAN_FILE"
-    [[ ! -f "$netplan_file" ]] && netplan_file=$(find_any_netplan_file)
 
     while IFS= read -r iface; do
         [[ -z "$iface" ]] && continue
@@ -532,22 +525,28 @@ show_initial_status() {
             echo -e "   ${YELLOW}Активные IP:${NC} (нет)"
         fi
 
-        if [[ -n "$netplan_file" ]] && python3 -c "$PYTHON_HELPER" check_iface "$netplan_file" "$iface" 2>/dev/null; then
+        # FIX #5: различаем ошибку YAML и отсутствие интерфейса
+        local py_rc=0
+        python3 -c "$PYTHON_HELPER" check_iface "$NETPLAN_FILE" "$iface" 2>/dev/null || py_rc=$?
+        
+        if [[ $py_rc -eq 2 ]]; then
+            echo -e "   ${RED}⚠ Ошибка YAML в $NETPLAN_FILE — проверьте файл вручную${NC}"
+        elif [[ $py_rc -eq 0 ]]; then
             local netplan_ips
-            netplan_ips=$(python3 -c "$PYTHON_HELPER" list_ips "$netplan_file" "$iface" 2>/dev/null | grep -v '^EMPTY$' | cut -d'|' -f2 | tr '\n' ' ')
+            netplan_ips=$(python3 -c "$PYTHON_HELPER" list_ips "$NETPLAN_FILE" "$iface" 2>/dev/null | grep -v '^EMPTY$' | cut -d'|' -f2 | tr '\n' ' ')
             if [[ -n "$netplan_ips" ]]; then
-                echo -e "   ${CYAN}IP в конфиге:${NC} $netplan_ips"
+                echo -e "   ${CYAN}IP в $NETPLAN_FILE:${NC} $netplan_ips"
             fi
 
             local netplan_dns
-            netplan_dns=$(python3 -c "$PYTHON_HELPER" get_dns "$netplan_file" 2>/dev/null | grep "^$iface|" | cut -d'|' -f2)
+            netplan_dns=$(python3 -c "$PYTHON_HELPER" get_dns "$NETPLAN_FILE" 2>/dev/null | grep "^$iface|" | cut -d'|' -f2)
             if [[ -n "$netplan_dns" ]]; then
-                echo -e "   ${MAGENTA}DNS в Netplan:${NC} ${netplan_dns//,/ }"
+                echo -e "   ${MAGENTA}DNS в $NETPLAN_FILE:${NC} ${netplan_dns//,/ }"
             else
-                echo -e "   ${MAGENTA}DNS в Netplan:${NC} (не задан)"
+                echo -e "   ${MAGENTA}DNS в $NETPLAN_FILE:${NC} (не задан)"
             fi
         else
-            echo -e "   ${CYAN}IP в Netplan:${NC} (не описан)"
+            echo -e "   ${CYAN}IP в $NETPLAN_FILE:${NC} (не описан)"
         fi
         echo
     done < <(get_interfaces)
@@ -634,18 +633,22 @@ input_ips() {
 }
 
 show_netplan_config() {
-    header "Текущая конфигурация Netplan"
-    local netplan_file
-    netplan_file=$(find_any_netplan_file)
-    if [[ -z "$netplan_file" ]]; then
-        warn "Файлы конфигурации Netplan не найдены."
-        return 1
+    header "Конфигурация Netplan"
+    echo -e "${BLUE}Выделенный файл скрипта:${NC} $NETPLAN_FILE"
+    if [[ -f "$NETPLAN_FILE" ]]; then
+        echo -e "${BLUE}Содержимое:${NC}"
+        cat "$NETPLAN_FILE"
+    else
+        echo -e "${YELLOW}(файл ещё не создан)${NC}"
     fi
-    echo -e "${BLUE}Найден файл:${NC} $netplan_file\n"
-    [[ -f "$netplan_file" ]] && cat "$netplan_file"
     echo
-    echo -e "${BLUE}Структура конфига:${NC}"
-    python3 -c "$PYTHON_HELPER" show_structure "$netplan_file"
+    echo -e "${BLUE}Все файлы в /etc/netplan/:${NC}"
+    ls -1 /etc/netplan/*.yaml 2>/dev/null || echo "  (нет)"
+    echo
+    if [[ -f "$NETPLAN_FILE" ]]; then
+        echo -e "${BLUE}Структура выделенного файла:${NC}"
+        python3 -c "$PYTHON_HELPER" show_structure "$NETPLAN_FILE"
+    fi
 }
 
 # ---------- Операции с IP ----------
@@ -661,8 +664,18 @@ add_ips_to_netplan() {
     create_backup "$netplan_file" "$backup"
     info "Бэкап создан: $backup"
 
-    if ! python3 -c "$PYTHON_HELPER" check_iface "$netplan_file" "$iface"; then
-        warn "Интерфейс '$iface' не описан в $netplan_file."
+    # FIX #5: различаем ошибку YAML и отсутствие интерфейса
+    local py_rc=0
+    python3 -c "$PYTHON_HELPER" check_iface "$netplan_file" "$iface" 2>/dev/null || py_rc=$?
+    
+    if [[ $py_rc -eq 2 ]]; then
+        error "Ошибка парсинга YAML в $netplan_file. Откат..."
+        install -m 600 "$backup" "$netplan_file"
+        return 1
+    fi
+    
+    if [[ $py_rc -eq 1 ]]; then
+        warn "Интерфейс '$iface' не описан в выделенном файле $netplan_file."
         echo "  Как настроить интерфейс?"
         echo -e "    ${GREEN}1${NC}) Только статика (dhcp4: false) — рекомендуется"
         echo -e "    ${GREEN}2${NC}) Статика + DHCP одновременно"
@@ -729,7 +742,7 @@ add_ips_to_netplan() {
         applied) info "✅ Конфигурация обновлена!" ;;
         saved)   info "💾 Изменения сохранены. Примените: sudo netplan apply" ;;
         bad_choice) warn "⚠ Некорректный выбор. Примените вручную: sudo netplan apply" ;;
-        failed)  warn " Изменения не применены (произошёл откат к резервной копии)." ;;
+        failed)  warn "⚠ Изменения не применены (произошёл откат к резервной копии)." ;;
     esac
 }
 
@@ -929,14 +942,14 @@ apply_dns_to_netplan() {
     local netplan_file
     netplan_file=$(ensure_netplan_file)
 
-    # Проверяем, есть ли уже DNS для этого интерфейса
+    # Проверяем, есть ли уже DNS для этого интерфейса в выделенном файле
     local existing_dns
     existing_dns=$(python3 -c "$PYTHON_HELPER" get_dns "$netplan_file" 2>/dev/null | grep "^$iface|" | cut -d'|' -f2)
 
     local mode="replace"
     if [[ -n "$existing_dns" ]]; then
         echo
-        warn "Для интерфейса $iface уже настроены DNS: ${existing_dns//,/ }"
+        warn "Для интерфейса $iface уже настроены DNS в выделенном файле: ${existing_dns//,/ }"
         echo -e "  ${GREEN}1${NC}) Заменить старые DNS на новые (рекомендуется)"
         echo -e "  ${GREEN}2${NC}) Добавить новые DNS к существующим"
         echo -e "  ${RED}0${NC}) Отмена"
@@ -956,8 +969,18 @@ apply_dns_to_netplan() {
     create_backup "$netplan_file" "$backup"
     info "Бэкап создан: $backup"
 
-    if ! python3 -c "$PYTHON_HELPER" check_iface "$netplan_file" "$iface"; then
-        warn "Интерфейс '$iface' не описан в $netplan_file."
+    # FIX #5: различаем ошибку YAML и отсутствие интерфейса
+    local py_rc=0
+    python3 -c "$PYTHON_HELPER" check_iface "$netplan_file" "$iface" 2>/dev/null || py_rc=$?
+    
+    if [[ $py_rc -eq 2 ]]; then
+        error "Ошибка парсинга YAML в $netplan_file. Откат..."
+        install -m 600 "$backup" "$netplan_file"
+        return 1
+    fi
+    
+    if [[ $py_rc -eq 1 ]]; then
+        warn "Интерфейс '$iface' не описан в выделенном файле $netplan_file."
         local ans
         safe_read -p "Создать секцию с dhcp4: false (только статика)? (Y/n): " ans || return 1
         if [[ "${ans,,}" != "n" ]]; then
@@ -1076,12 +1099,10 @@ dns_management() {
                 ;;
             7)
                 header "Текущие DNS"
-                local netplan_file
-                netplan_file=$(find_any_netplan_file)
-                if [[ -n "$netplan_file" ]]; then
-                    echo -e "${BLUE}В $netplan_file:${NC}"
+                echo -e "${BLUE}В выделенном файле $NETPLAN_FILE:${NC}"
+                if [[ -f "$NETPLAN_FILE" ]]; then
                     local dns_info
-                    dns_info=$(python3 -c "$PYTHON_HELPER" get_dns "$netplan_file" 2>/dev/null)
+                    dns_info=$(python3 -c "$PYTHON_HELPER" get_dns "$NETPLAN_FILE" 2>/dev/null)
                     if [[ "$dns_info" == "EMPTY" || -z "$dns_info" ]]; then
                         echo "  (не заданы)"
                     else
@@ -1090,10 +1111,10 @@ dns_management() {
                         done <<< "$dns_info"
                     fi
                 else
-                    echo -e "${BLUE}Файлы Netplan не найдены.${NC}"
+                    echo "  (файл не создан)"
                 fi
                 echo
-                echo -e "${BLUE}Активные в системе:${NC}"
+                echo -e "${BLUE}Активные в системе (из всех источников):${NC}"
                 local active_dns
                 active_dns=$(get_active_dns)
                 if [[ -n "$active_dns" ]]; then
