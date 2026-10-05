@@ -1,4 +1,4 @@
-[![VDSINA — хостинг VPS и VDS](vps-setup/assets/banner.png)](https://www.vdsina.com/?partner=f963ce3tpyrr)
+[![VDSINA — хостинг VPS и VDS](.vps-setup/assets/banner.png)](https://www.vdsina.com/?partner=f963ce3tpyrr)
 # 🌐 Интерактивный менеджер IP-адресов и DNS-серверов для Netplan - Set-IPs
 
 ## 📋 Описание
